@@ -5,3 +5,6 @@ plotly
 scipy
 openpyxl
 xlrd
+nixtla
+statsforecast
+scikit-learn

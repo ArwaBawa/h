@@ -4,6 +4,7 @@ ACWA Power Challenge Solution using Nixtla TimeGPT
 """
 
 # ============= Imports =============
+import os
 import re
 import io
 import numpy as np
@@ -96,7 +97,7 @@ def _looks_like_time(s: str) -> bool:
     s = str(s).strip()
     return bool(re.match(r"^\d{1,2}:\d{2}(:\d{2})?$", s))
 
-# ============= Robust time parser (FIX) =============
+# ============= Robust time parser =============
 def build_timestamps_from_time_column(time_series: pd.Series) -> pd.Series:
     """
     Parse a 'Time' column that might be:
@@ -105,10 +106,10 @@ def build_timestamps_from_time_column(time_series: pd.Series) -> pd.Series:
       - Excel serials (fractions of a day or date+time serials)
     Return full timestamps by rolling the day when time-of-day decreases.
     """
-    # 1) General parser (handles full datetimes & many string formats)
+    # 1) Generic parse
     t_dt = pd.to_datetime(time_series, errors="coerce")
 
-    # 2) Excel serials (e.g., 0.75 or 45234.5) → datetime
+    # 2) Excel serials → datetime
     num = pd.to_numeric(time_series, errors="coerce")
     mask = t_dt.isna() & num.notna()
     if mask.any():
@@ -116,7 +117,7 @@ def build_timestamps_from_time_column(time_series: pd.Series) -> pd.Series:
             num[mask], unit="D", origin="1899-12-30", errors="coerce"
         )
 
-    # 3) Strict time-only strings (ensure we COERCE, never IGNORE)
+    # 3) Strict time-only strings
     mask = t_dt.isna()
     if mask.any():
         t_dt.loc[mask] = pd.to_datetime(
@@ -132,9 +133,7 @@ def build_timestamps_from_time_column(time_series: pd.Series) -> pd.Series:
             errors="coerce"
         )
 
-    # 4) Enforce datetimelike dtype
     t_dt = pd.to_datetime(t_dt, errors="coerce")
-
     if t_dt.isna().all():
         raise ValueError("Unable to parse the 'Time' column into datetime.")
 
@@ -198,7 +197,7 @@ def transform_real_electrolyzer(file_like_or_path, n_cells=200, faradaic_eff=0.9
     non_empty = [time_col] + [c for c in data.columns if c != time_col and data[c].notna().any()]
     data = data[non_empty]
 
-    # === FIXED: Build timestamps robustly ===
+    # Timestamps
     ts_series = build_timestamps_from_time_column(data[time_col])
 
     # Fuzzy map headers → canonical names
@@ -227,7 +226,7 @@ def transform_real_electrolyzer(file_like_or_path, n_cells=200, faradaic_eff=0.9
     data.insert(0, "timestamp", pd.to_datetime(ts_series))
 
     # Derivations
-    if "stack_current" in data.columns and current_units.lower() == "ka":
+    if "stack_current" in data.columns and str(current_units).lower() == "ka":
         data["stack_current"] = data["stack_current"] * 1000.0
 
     if {"stack_voltage","stack_current"}.issubset(data.columns):
@@ -279,24 +278,164 @@ def transform_real_electrolyzer(file_like_or_path, n_cells=200, faradaic_eff=0.9
 
 @st.cache_data(show_spinner=False)
 def load_canonical_or_transform(n_cells=200, faradaic_eff=0.96, current_units="A"):
-    """
-    Try bundled canonical CSV first, else transform bundled Excel.
-    """
+    """Try bundled canonical CSV first, else transform bundled Excel."""
     try:
         return load_csv_canonical("data/ACWA_Power2_canonical_from_template.csv")
     except Exception:
         pass
     return transform_real_electrolyzer("data/ACWA Power 2.xlsx", n_cells, faradaic_eff, current_units)
 
-# ============= App Title =============
+# ============= Title =============
 st.title(" Green Hydrogen Electrolyzer Predictive Maintenance System")
 st.markdown("**ACWA Power Challenge Solution** | Powered by Nixtla TimeGPT & Advanced Analytics")
+
+# ============= Nixtla / TimeGPT integration =============
+# Try to import either 'nixtla' (NixtlaClient) or 'timegpt' (TimeGPT) for robustness
+try:
+    from nixtla import NixtlaClient as _TimeGPTClient
+    _TIMEGPT_FLAVOR = "nixtla"
+    _TIMEGPT_AVAILABLE = True
+except Exception:
+    try:
+        from timegpt import TimeGPT as _TimeGPTClient   # fallback legacy
+        _TIMEGPT_FLAVOR = "timegpt"
+        _TIMEGPT_AVAILABLE = True
+    except Exception:
+        _TIMEGPTClient = None
+        _TIMEGPT_FLAVOR = None
+        _TIMEGPT_AVAILABLE = False
+
+def init_timegpt(api_key: str = None):
+    """Initialize TimeGPT client from secrets/env/input."""
+    if not _TIMEGPT_AVAILABLE:
+        return None, "TimeGPT library not installed. Add 'nixtla' to requirements.txt."
+    key = api_key or st.secrets.get("NIXTLA_API_KEY", None) or os.getenv("NIXTLA_API_KEY", None)
+    if not key:
+        return None, "No TimeGPT API key set. Add it to Streamlit secrets or paste it in the sidebar."
+    try:
+        # class signatures vary slightly; try both
+        try:
+            client = _TIMEGPTClient(api_key=key)
+        except TypeError:
+            client = _TIMEGPTClient(token=key)
+        return client, None
+    except Exception as e:
+        return None, f"Failed to initialize TimeGPT client: {e}"
+
+def prepare_timegpt_frames(df_in: pd.DataFrame):
+    """Build Nixtla/TimeGPT frames: df( unique_id, ds, y ) + optional exogenous X_df."""
+    df = df_in.copy().sort_values("timestamp")
+    target = pd.to_numeric(df.get("cell_voltage"), errors="coerce")
+    nixtla_df = pd.DataFrame({
+        "unique_id": "electrolyzer_1",
+        "ds": pd.to_datetime(df["timestamp"]),
+        "y": target,
+    })
+    mask = nixtla_df["y"].notna() & nixtla_df["ds"].notna()
+    nixtla_df = nixtla_df.loc[mask].reset_index(drop=True)
+
+    exog_cols = [c for c in ["stack_current","electrolyte_temperature","cycles_count","hours_since_maintenance"]
+                 if c in df.columns]
+    X_df = None
+    if exog_cols:
+        X_df = pd.concat([
+            pd.Series("electrolyzer_1", index=df.index, name="unique_id"),
+            df["timestamp"].rename("ds"),
+            df[exog_cols]
+        ], axis=1)
+        X_df = X_df.loc[mask].reset_index(drop=True)
+    return nixtla_df, X_df, exog_cols
+
+def timegpt_forecast(client, nixtla_df, h, X_df=None, freq="H", level=[90,95]):
+    """Call TimeGPT forecast and return raw forecast frame."""
+    try:
+        if hasattr(client, "forecast"):
+            fc = client.forecast(
+                df=nixtla_df,
+                h=int(h),
+                time_col="ds",
+                target_col="y",
+                id_col="unique_id",
+                freq=freq,
+                X_df=X_df,
+                level=level
+            )
+        else:
+            fc = client.forecast(df=nixtla_df, h=int(h), time_col="ds",
+                                 target_col="y", id_col="unique_id", freq=freq, X_df=X_df)
+        return fc, None
+    except Exception as e:
+        return None, str(e)
+
+def unify_timegpt_forecast(fc_raw: pd.DataFrame) -> pd.DataFrame:
+    """Map TimeGPT output columns to app's standard columns."""
+    f = fc_raw.copy()
+    lower = {c.lower(): c for c in f.columns}
+
+    def pick(*cands):
+        for c in cands:
+            if c in lower: return lower[c]
+        return None
+
+    ds_col = pick("ds","date","timestamp") or f.columns[0]
+    mean_col = pick("timegpt","yhat","forecast","prediction","point_forecast")
+    lo95_col = pick("timegpt-lo-95","lo-95","yhat_lo_95","lower_95","low_95","forecast_lo_95","lo_95")
+    hi95_col = pick("timegpt-hi-95","hi-95","yhat_hi_95","upper_95","high_95","forecast_hi_95","hi_95")
+    std_col = pick("forecast_std","yhat_std","std")
+
+    # Build base
+    out = pd.DataFrame({"timestamp": pd.to_datetime(f[ds_col])})
+    if mean_col is not None:
+        out["predicted_voltage"] = pd.to_numeric(f[mean_col], errors="coerce")
+    else:
+        out["predicted_voltage"] = np.nan
+
+    if std_col is not None:
+        std = pd.to_numeric(f[std_col], errors="coerce")
+    elif lo95_col is not None and hi95_col is not None and mean_col is not None:
+        std = (pd.to_numeric(f[hi95_col], errors="coerce") - pd.to_numeric(f[mean_col], errors="coerce")) / 1.96
+    else:
+        std = pd.Series(np.nan, index=f.index)
+
+    if lo95_col is not None and hi95_col is not None:
+        out["lower_bound"] = pd.to_numeric(f[lo95_col], errors="coerce")
+        out["upper_bound"] = pd.to_numeric(f[hi95_col], errors="coerce")
+    else:
+        out["lower_bound"] = out["predicted_voltage"] - 1.96*std
+        out["upper_bound"] = out["predicted_voltage"] + 1.96*std
+
+    out["uncertainty"] = std.replace([np.inf,-np.inf], np.nan)
+    # Failure probability vs 2.0 V
+    out["failure_probability"] = 1 - stats.norm.cdf(2.0, out["predicted_voltage"], out["uncertainty"])
+    return out
+
+def timegpt_anomalies(client, nixtla_df, confidence=99, method="iqr"):
+    try:
+        if hasattr(client, "detect_anomalies"):
+            res = client.detect_anomalies(
+                df=nixtla_df, time_col="ds", target_col="y", id_col="unique_id",
+                freq="H", anomaly_detection_params={"confidence_level":int(confidence), "method":method}
+            )
+            return res, None
+        return None, "This client does not support anomaly detection."
+    except Exception as e:
+        return None, str(e)
+
+def timegpt_cross_validation(client, nixtla_df, h=24, n_windows=5):
+    try:
+        res = client.cross_validation(
+            df=nixtla_df, h=int(h), n_windows=int(n_windows),
+            time_col="ds", target_col="y", id_col="unique_id", freq="H"
+        )
+        return res, None
+    except Exception as e:
+        return None, str(e)
 
 # ============= Sidebar =============
 with st.sidebar:
     st.image("https://via.placeholder.com/300x100/1c83e1/ffffff?text=ACWA+Power", use_container_width=True)
     st.markdown("### ⚙️ System Configuration")
-    model_type = st.selectbox("Select Prediction Model", ["Nixtla TimeGPT","Statistical Ensemble","XGBoost ML","Hybrid Approach"])
+    model_type = st.selectbox("Select Prediction Model", ["Nixtla TimeGPT","Statistical Ensemble","XGBoost ML","Hybrid Approach","(Simulated Baseline)"])
     forecast_horizon = st.slider("Forecast Horizon (hours)", 24, 168, 72, step=24)
     risk_threshold = st.slider("Risk Alert Threshold (%)", 50, 95, 75, step=5)
 
@@ -306,6 +445,11 @@ with st.sidebar:
     faradaic_eff = st.slider("Faradaic efficiency (ηF)", 0.80, 1.00, 0.96, 0.01)
     current_units = st.selectbox("Current units in source", ["A","kA"])
     temp_target = st.number_input("Target electrolyte temperature (°C)", value=85.0, step=0.5)
+
+    st.markdown("---")
+    st.markdown("### 🔐 TimeGPT Access")
+    api_key_input = st.text_input("Nixtla TimeGPT API Key", type="password",
+                                  help="Optional here if you already set NIXTLA_API_KEY in Streamlit secrets.")
 
     st.markdown("---")
     st.markdown("### 📊 Data Source")
@@ -377,8 +521,8 @@ def calculate_risk_metrics(df_in: pd.DataFrame, temp_target_c=85.0, temp_col_nam
 
 risk_metrics = calculate_risk_metrics(df_view, temp_target, temp_col if temp_col else "electrolyte_temperature")
 
-# ============= Predictions (simulated) =============
-def generate_predictions(df_in: pd.DataFrame, horizon: int) -> pd.DataFrame:
+# ============= Simulated fallback (for when TimeGPT is unavailable) =============
+def generate_predictions_simulated(df_in: pd.DataFrame, horizon: int) -> pd.DataFrame:
     last_timestamp = df_in["timestamp"].max()
     future_timestamps = pd.date_range(start=last_timestamp + timedelta(hours=1), periods=horizon, freq="H")
 
@@ -411,7 +555,9 @@ def generate_predictions(df_in: pd.DataFrame, horizon: int) -> pd.DataFrame:
     return pred_df
 
 # ============= Tabs =============
-tab1, tab2, tab3, tab4 = st.tabs(["📈 Real-time Monitoring","⚠️ Failure Prediction","⚠️ Risk Assessment","📋 Maintenance Planning"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "📈 Real-time Monitoring","⚠️ Failure Prediction","⚠️ Risk Assessment","📋 Maintenance Planning","🧪 Validation"
+])
 
 # ---------- Tab 1 ----------
 with tab1:
@@ -524,19 +670,39 @@ with tab1:
         else:
             st.info("Hours Since Maintenance: N/A")
 
-            
-
-# ---------- Tab 2 ----------
 # ---------- Tab 2 ----------
 with tab2:
     st.markdown("### Predictive Analytics - Equipment Failure Forecast")
 
     if st.button("Generate Predictions", type="primary"):
-        with st.spinner("Running Nixtla TimeGPT model (simulated)…"):
-            st.session_state.predictions = generate_predictions(df_view, forecast_horizon)
+        with st.spinner("Running forecast..."):
+            pred_df = None
+            used_model = "(simulated)"
+
+            if model_type == "Nixtla TimeGPT":
+                client, err = init_timegpt(api_key_input)
+                if err:
+                    st.warning(f"TimeGPT not used: {err}")
+                else:
+                    nixtla_df, X_df, exog = prepare_timegpt_frames(df_view if op_only else df)
+                    fc_raw, f_err = timegpt_forecast(client, nixtla_df, forecast_horizon, X_df=None)  # univariate by default
+                    if f_err:
+                        st.warning(f"TimeGPT error → using simulated model: {f_err}")
+                    else:
+                        pred_df = unify_timegpt_forecast(fc_raw)
+                        used_model = "Nixtla TimeGPT"
+
+            if pred_df is None:
+                pred_df = generate_predictions_simulated(df_view, forecast_horizon)
+
+            st.session_state.predictions = pred_df
+            st.session_state.used_model = used_model
 
     if st.session_state.get("predictions") is not None:
         pred_df = st.session_state.predictions
+        used_model = st.session_state.get("used_model","(simulated)")
+
+        st.caption(f"Model used: **{used_model}**")
 
         # --- Prediction summary cards ---
         col1, col2, col3, col4 = st.columns(4)
@@ -555,39 +721,12 @@ with tab2:
             else:
                 st.metric("Time to Critical", "No Risk", "✅ Safe")
         with col4:
-            confidence = 100 - (pred_df["uncertainty"].mean() * 100)
-            st.metric("Model Confidence", f"{confidence:.1f}%", "High" if confidence>80 else "Medium")
-
-        # --- New: Validation Snapshot ---
-        try:
-            bt_details, calib, err = rolling_backtest(
-                df_view if op_only else df,
-                horizon=int(forecast_horizon),
-                window=168,   # 1-week training window
-                step=24,      # evaluate every day
-                risk_thr_percent=int(risk_threshold)
-            )
-        except NameError:
-            bt_details, calib, err = None, None, "rolling_backtest not available"
-
-        if (err is None) and (bt_details is not None) and (len(bt_details) > 0):
-            pi95_cov = float(bt_details["PI95_coverage"].mean())
-            rmse     = float(bt_details["RMSE"].mean())
-            brier    = float(bt_details["Brier"].mean())
-
-            st.markdown("#### Validation Snapshot (recent walk-forward)")
-            k1, k2, k3 = st.columns(3)
-            with k1:
-                st.metric("PI95 Coverage (backtest)", f"{pi95_cov:.0%}", help="Should be near 95% if intervals are well-calibrated")
-            with k2:
-                st.metric("RMSE (backtest)", f"{rmse:.3f} V", help="Lower is better")
-            with k3:
-                st.metric("Brier score", f"{brier:.3f}", help="Probability calibration; lower is better")
-        else:
-            st.info("No backtest snapshot available yet. Use the Validation tab for full evaluation.")
+            # If uncertainty exists, show derived confidence notion
+            mean_unc = pd.to_numeric(pred_df.get("uncertainty"), errors="coerce").dropna().mean()
+            confidence = 100 - (mean_unc * 100) if pd.notna(mean_unc) else 80.0
+            st.metric("Model Confidence (proxy)", f"{confidence:.1f}%", "High" if confidence>80 else "Medium")
 
         st.markdown("---")
-
         # --- Charts ---
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=df_view["timestamp"].tail(168), y=df_view["cell_voltage"].tail(168), mode="lines", name="Historical"))
@@ -608,24 +747,29 @@ with tab2:
         fig.update_layout(xaxis_title="Time", yaxis_title="Failure Probability (%)", height=300)
         st.plotly_chart(fig, use_container_width=True)
 
-        st.markdown("#### Component-wise Failure Risk Analysis")
-        components = ["Diaphragm","Electrode","Seal","Vessel","Sensors"]
-        dp = last_valid_nonzero(df_view.get("differential_pressure")) or 0.0
-        temp_now = last_valid_nonzero(df_view.get("electrolyte_temperature")) if "electrolyte_temperature" in df_view.columns else (last_valid_nonzero(df_view.get("ambient_temperature")) or 85.0)
-        cycles = last_valid_nonzero(df_view.get("cycles_count")) or 0.0
-        hours = last_valid_nonzero(df_view.get("hours_since_maintenance")) or 0.0
-        conc = last_valid_nonzero(df_view.get("electrolyte_concentration")) or 30.0
-        comp_risks = []
-        for comp in components:
-            if comp=="Diaphragm": r = min(100, (dp/50 + (temp_now-85)/10)*30)
-            elif comp=="Electrode": r = min(100, cycles/20)
-            elif comp=="Seal": r = min(100, hours/30)
-            elif comp=="Vessel": r = min(100, max(0, (conc-30))*10)
-            else: r = np.random.uniform(10,40)
-            comp_risks.append(max(0, r))
-        fig = go.Figure(data=[go.Bar(x=components, y=comp_risks, text=[f"{r:.1f}%" for r in comp_risks], textposition="auto")])
-        fig.update_layout(title="Component Failure Risk Assessment", xaxis_title="Component", yaxis_title="Risk Level (%)", height=300)
-        st.plotly_chart(fig, use_container_width=True)
+        # Optional anomaly detection (TimeGPT only)
+        if model_type == "Nixtla TimeGPT":
+            client, err = init_timegpt(api_key_input)
+            if not err:
+                nixtla_df, _, _ = prepare_timegpt_frames(df_view if op_only else df)
+                with st.expander("🔎 Anomaly Detection (TimeGPT)"):
+                    with st.spinner("Detecting anomalies..."):
+                        anom, aerr = timegpt_anomalies(client, nixtla_df, confidence=99, method="iqr")
+                    if aerr:
+                        st.info(f"Anomaly detection unavailable: {aerr}")
+                    else:
+                        # Expect columns like ds, y, anomaly
+                        anom = anom.rename(columns={"ds":"timestamp","y":"cell_voltage"})
+                        st.dataframe(anom.tail(30), use_container_width=True)
+                        # Overlay anomalies (if flagged) on history
+                        if "anomaly" in anom.columns:
+                            a = anom[anom["anomaly"]==1]
+                            fig = go.Figure()
+                            fig.add_trace(go.Scatter(x=nixtla_df["ds"], y=nixtla_df["y"], mode="lines", name="Cell Voltage"))
+                            if not a.empty:
+                                fig.add_trace(go.Scatter(x=a["timestamp"], y=a["cell_voltage"], mode="markers", name="Anomaly", marker=dict(size=8)))
+                            fig.update_layout(title="Detected Anomalies", xaxis_title="Time", yaxis_title="Cell Voltage (V)")
+                            st.plotly_chart(fig, use_container_width=True)
 
 # ---------- Tab 3 ----------
 with tab3:
@@ -766,12 +910,70 @@ with tab4:
     st.markdown("---")
     st.button("📄 Generate Maintenance Report", type="primary")
 
+# ---------- Tab 5 (Validation) ----------
+with tab5:
+    st.markdown("### 🧪 Model Validation (TimeGPT Cross‑Validation)")
+    st.caption("Walk‑forward backtesting using Nixtla TimeGPT API for the 'cell_voltage' series.")
+    client, err = init_timegpt(api_key_input)
+    if err:
+        st.info(f"TimeGPT validation unavailable: {err}")
+    else:
+        nixtla_df, _, _ = prepare_timegpt_frames(df_view if op_only else df)
+        n_windows = st.slider("Number of CV windows", 2, 10, 5, 1)
+        h_cv = st.slider("Horizon per window (hours)", 6, 48, 24, 6)
+        with st.spinner("Running cross‑validation..."):
+            cv, cv_err = timegpt_cross_validation(client, nixtla_df, h=h_cv, n_windows=n_windows)
+        if cv_err:
+            st.error(f"Cross‑validation error: {cv_err}")
+        else:
+            # Expect columns like: ds, y, yhat, (maybe intervals)
+            cv = cv.rename(columns={"ds":"timestamp","y":"actual","yhat":"forecast"})
+            st.dataframe(cv.tail(30), use_container_width=True)
+
+            # Metrics
+            # RMSE
+            rmse = float(np.sqrt(np.mean((pd.to_numeric(cv["forecast"], errors="coerce") -
+                                          pd.to_numeric(cv["actual"], errors="coerce"))**2)))
+            # Coverage (95) if intervals exist
+            lo = None; hi = None
+            for cand in ["lo-95","yhat_lo_95","lower_95","lo_95"]:
+                if cand in [c.lower() for c in cv.columns]:
+                    lo = cv[[c for c in cv.columns if c.lower()==cand][0]]
+                    break
+            for cand in ["hi-95","yhat_hi_95","upper_95","hi_95"]:
+                if cand in [c.lower() for c in cv.columns]:
+                    hi = cv[[c for c in cv.columns if c.lower()==cand][0]]
+                    break
+            if lo is not None and hi is not None:
+                inside = (pd.to_numeric(cv["actual"], errors="coerce") >= pd.to_numeric(lo, errors="coerce")) & \
+                         (pd.to_numeric(cv["actual"], errors="coerce") <= pd.to_numeric(hi, errors="coerce"))
+                pi95_cov = float(inside.mean())
+            else:
+                pi95_cov = np.nan
+
+            # Brier (proxy): classify exceedance of 2.0V based on forecast vs actual
+            y_event = (pd.to_numeric(cv["actual"], errors="coerce") >= 2.0).astype(float)
+            p_event = (pd.to_numeric(cv["forecast"], errors="coerce") >= 2.0).astype(float)  # 0/1 proxy
+            brier = float(np.mean((p_event - y_event)**2))
+
+            k1, k2, k3 = st.columns(3)
+            with k1: st.metric("RMSE (CV)", f"{rmse:.4f} V")
+            with k2: st.metric("PI95 Coverage", f"{pi95_cov:.0%}" if pd.notna(pi95_cov) else "N/A")
+            with k3: st.metric("Brier score", f"{brier:.3f}")
+
+            # Plot sample window
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=cv["timestamp"], y=cv["actual"], name="Actual", mode="lines"))
+            fig.add_trace(go.Scatter(x=cv["timestamp"], y=cv["forecast"], name="Forecast", mode="lines"))
+            fig.update_layout(title="Cross‑Validation Forecast vs Actual", xaxis_title="Time", yaxis_title="Cell Voltage (V)")
+            st.plotly_chart(fig, use_container_width=True)
+
 # ---------- Footer ----------
 st.markdown("---")
 st.markdown("""
 <div style='text-align: center; color: #888;'>
     <small>
-    Green Hydrogen Electrolyzer Predictive Maintenance System v1.1<br>
+    Green Hydrogen Electrolyzer Predictive Maintenance System v1.2<br>
     Powered by Nixtla TimeGPT & Advanced Analytics<br>
     ACWA Power Challenge Solution 2024
     </small>
