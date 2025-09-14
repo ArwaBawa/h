@@ -59,7 +59,7 @@ def last_valid_nonzero(s: pd.Series) -> float:
     return s.iloc[-1] if not s.empty else np.nan
 
 def delta_24_rows(s: pd.Series) -> float:
-    """Delta between last valid value and value 24 rows earlier (ignoring zeros)."""
+    """Delta between last valid value and the value 24 rows earlier (ignoring zeros)."""
     if s is None:
         return np.nan
     s = pd.to_numeric(s, errors="coerce").replace(0, np.nan).dropna()
@@ -86,7 +86,9 @@ def load_csv_canonical(file_like_or_path):
 @st.cache_data(show_spinner=False)
 def load_excel_raw_headerless(file_like_or_path, sheet_name=None):
     xl = pd.ExcelFile(file_like_or_path)
-    sheet = sheet_name or ("Data Recording Table Template" if "Data Recording Table Template" in xl.sheet_names else xl.sheet_names[0])
+    sheet = sheet_name or ("Data Recording Table Template"
+                           if "Data Recording Table Template" in xl.sheet_names
+                           else xl.sheet_names[0])
     raw = pd.read_excel(xl, sheet_name=sheet, header=None)
     return raw, sheet
 
@@ -94,9 +96,57 @@ def _looks_like_time(s: str) -> bool:
     s = str(s).strip()
     return bool(re.match(r"^\d{1,2}:\d{2}(:\d{2})?$", s))
 
+# ============= Robust time parser (FIX) =============
+def build_timestamps_from_time_column(time_series: pd.Series) -> pd.Series:
+    """
+    Parse a 'Time' column that might be:
+      - 'HH:MM' or 'HH:MM:SS' strings
+      - full datetimes like '1900-01-01 06:30:00'
+      - Excel serials (fractions of a day or date+time serials)
+    Return full timestamps by rolling the day when time-of-day decreases.
+    """
+    # 1) General parser (handles full datetimes, many formats)
+    t_dt = pd.to_datetime(time_series, errors="coerce")
+
+    # 2) Excel serials → datetime
+    num = pd.to_numeric(time_series, errors="coerce")
+    mask = t_dt.isna() & num.notna()
+    if mask.any():
+        # Excel origin for pandas is '1899-12-30'
+        t_dt.loc[mask] = pd.to_datetime(num[mask], unit="D", origin="1899-12-30", errors="coerce")
+
+    # 3) Strict time-only formats
+    mask = t_dt.isna()
+    if mask.any():
+        # HH:MM:SS
+        t_dt.loc[mask] = pd.to_datetime(time_series[mask].astype(str).str.strip(),
+                                        format="%H:%M:%S", errors="ignore")
+    mask = t_dt.isna()
+    if mask.any():
+        # HH:MM
+        t_dt.loc[mask] = pd.to_datetime(time_series[mask].astype(str).str.strip(),
+                                        format="%H:%M", errors="coerce")
+
+    if t_dt.isna().all():
+        raise ValueError("Unable to parse the 'Time' column into datetime.")
+
+    # If real calendar dates are present (>1901), use them directly
+    if (t_dt.dt.year > 1901).any():
+        return t_dt
+
+    # Otherwise reconstruct dates by rolling at midnight
+    sec = (t_dt.dt.hour * 3600 + t_dt.dt.minute * 60 + t_dt.dt.second).astype("Int64")
+    roll = (sec.diff() < 0).cumsum().fillna(0).astype(int)
+    base_date = pd.Timestamp("2024-01-01")
+    timestamps = base_date + pd.to_timedelta(roll, unit="D") + pd.to_timedelta(sec.astype(float), unit="s")
+    return timestamps
+
 # ============= Transformer (Excel → canonical hourly) =============
 @st.cache_data(show_spinner=False)
 def transform_real_electrolyzer(file_like_or_path, n_cells=200, faradaic_eff=0.96, current_units="A"):
+    """
+    Robust transformer for ACWA 'Data Recording Table Template' → canonical hourly dataset.
+    """
     raw, sheet = load_excel_raw_headerless(file_like_or_path)
 
     # Find header row (contains "Time")
@@ -127,7 +177,8 @@ def transform_real_electrolyzer(file_like_or_path, n_cells=200, faradaic_eff=0.9
     time_col = time_col_candidates[0]
     data_start = None
     for i in range(header_row_idx+1, df.shape[0]):
-        if _looks_like_time(df.at[i, time_col]): data_start = i; break
+        if _looks_like_time(df.at[i, time_col]) or pd.notna(df.at[i, time_col]):
+            data_start = i; break
     if data_start is None:
         raise ValueError("Could not locate the start of time-series rows.")
     data = df.iloc[data_start:].reset_index(drop=True)
@@ -139,18 +190,8 @@ def transform_real_electrolyzer(file_like_or_path, n_cells=200, faradaic_eff=0.9
     non_empty = [time_col] + [c for c in data.columns if c != time_col and data[c].notna().any()]
     data = data[non_empty]
 
-    # Build timestamps (roll date at midnight)
-    t = data[time_col].astype(str).str.replace(r"^(\d{1,2}):(\d{2})$", r"\1:\2:00", regex=True)
-    is_midnight = t.eq("00:00:00")
-    day = np.zeros(len(t), dtype=int); d=0
-    for i in range(len(t)):
-        if i>0 and is_midnight.iat[i] and t.iat[i-1]!="00:00:00": d += 1
-        day[i] = d
-    base = pd.Timestamp("2024-01-01")
-    ts = []
-    for i, s in enumerate(t):
-        tt = pd.to_datetime(s, format="%H:%M:%S")
-        ts.append((base + pd.Timedelta(days=int(day[i]))).replace(hour=tt.hour, minute=tt.minute, second=tt.second))
+    # === FIXED: Build timestamps robustly ===
+    ts_series = build_timestamps_from_time_column(data[time_col])
 
     # Fuzzy map headers → canonical names
     colmap = {}
@@ -175,26 +216,34 @@ def transform_real_electrolyzer(file_like_or_path, n_cells=200, faradaic_eff=0.9
     if data.columns.duplicated().any():
         data = data.T.groupby(level=0).mean(numeric_only=True).T
 
-    data.insert(0, "timestamp", pd.to_datetime(ts))
+    data.insert(0, "timestamp", pd.to_datetime(ts_series))
 
     # Derivations
-    if "stack_current" in data.columns and _norm("A")==_norm(current_units) and current_units.lower()=="ka":
-        data["stack_current"] *= 1000.0
+    if "stack_current" in data.columns and current_units.lower() == "ka":
+        data["stack_current"] = data["stack_current"] * 1000.0
+
     if {"stack_voltage","stack_current"}.issubset(data.columns):
-        data["power_consumption"] = (data["stack_voltage"]*data["stack_current"])/1000.0
+        data["power_consumption"] = (pd.to_numeric(data["stack_voltage"], errors="coerce") *
+                                     pd.to_numeric(data["stack_current"], errors="coerce")) / 1000.0
+
     if "h2_production_rate" not in data.columns and "stack_current" in data.columns:
-        F = 96485.0; const = (1.0/(2.0*F))*0.022414*3600.0
-        data["h2_production_rate"] = data["stack_current"] * 200 * const * 0.96  # default n_cells=200, ηF=0.96
+        # Faraday: H2 mol/s = I / (2F), convert to Nm3/h (22.414 L/mol at STP)
+        F = 96485.0
+        const = (1.0 / (2.0 * F)) * 0.022414 * 3600.0  # Nm3/h per A per cell
+        data["h2_production_rate"] = (pd.to_numeric(data["stack_current"], errors="coerce") *
+                                      n_cells * const * faradaic_eff)
+
     if "o2_production_rate" not in data.columns and "h2_production_rate" in data.columns:
         data["o2_production_rate"] = data["h2_production_rate"] * 0.5
+
     if "cell_voltage" not in data.columns and "stack_voltage" in data.columns:
-        data["cell_voltage"] = data["stack_voltage"]/200.0
+        data["cell_voltage"] = pd.to_numeric(data["stack_voltage"], errors="coerce") / max(1, n_cells)
 
     if {"h2_production_rate","power_consumption"}.issubset(data.columns):
         with np.errstate(divide="ignore", invalid="ignore"):
-            data["efficiency"] = (pd.to_numeric(data["h2_production_rate"],errors="coerce") /
-                                  pd.to_numeric(data["power_consumption"],errors="coerce"))
-            data["efficiency"] = data["efficiency"].replace([np.inf,-np.inf], np.nan)
+            data["efficiency"] = (pd.to_numeric(data["h2_production_rate"], errors="coerce") /
+                                  pd.to_numeric(data["power_consumption"], errors="coerce"))
+            data["efficiency"] = data["efficiency"].replace([np.inf, -np.inf], np.nan)
 
     data = data.sort_values("timestamp").reset_index(drop=True)
     data["hours_since_maintenance"] = (data["timestamp"] - data["timestamp"].min())/np.timedelta64(1,"h")
@@ -206,6 +255,7 @@ def transform_real_electrolyzer(file_like_or_path, n_cells=200, faradaic_eff=0.9
     else:
         data["cycles_count"] = 0
 
+    # Hourly resample to stabilize charts/metrics
     data = data.set_index("timestamp")
     agg = {
         "cell_voltage":"mean","stack_current":"mean","electrolyte_temperature":"mean",
@@ -221,6 +271,9 @@ def transform_real_electrolyzer(file_like_or_path, n_cells=200, faradaic_eff=0.9
 
 @st.cache_data(show_spinner=False)
 def load_canonical_or_transform(n_cells=200, faradaic_eff=0.96, current_units="A"):
+    """
+    Try bundled canonical CSV first, else transform bundled Excel.
+    """
     try:
         return load_csv_canonical("data/ACWA_Power2_canonical_from_template.csv")
     except Exception:
@@ -261,14 +314,15 @@ df = None
 if uploaded_file is not None:
     name = (uploaded_file.name or "").lower()
     if name.endswith((".xlsx",".xls",".xlsm")):
-        df = transform_real_electrolyzer(io.BytesIO(read_file_as_bytes(uploaded_file)), n_cells, faradaic_eff, current_units)
+        df = transform_real_electrolyzer(io.BytesIO(read_file_as_bytes(uploaded_file)),
+                                         n_cells=n_cells, faradaic_eff=faradaic_eff, current_units=current_units)
         st.success("✅ Uploaded Excel transformed successfully.")
     else:
         df = load_csv_canonical(uploaded_file)
         st.success("✅ Uploaded CSV loaded as canonical dataset.")
 else:
     try:
-        df = load_canonical_or_transform(n_cells, faradaic_eff, current_units)
+        df = load_canonical_or_transform(n_cells=n_cells, faradaic_eff=faradaic_eff, current_units=current_units)
         if use_bundled:
             st.success("✅ Loaded bundled dataset.")
         else:
@@ -391,7 +445,6 @@ with tab1:
 
     st.markdown("---")
 
-    # Plots use df_view (optionally operating only)
     cA, cB = st.columns(2)
     with cA:
         st.markdown("#### Cell Voltage Trend")
@@ -423,7 +476,9 @@ with tab1:
                 mode="gauge+number+delta", value=val, title={'text': "H₂ Purity (%)"},
                 delta={'reference': 99.5},
                 gauge={'axis': {'range': [None, 100]},
-                       'steps':[{'range':[0,98],'color':"lightgray"},{'range':[98,99.5],'color':"yellow"},{'range':[99.5,100],'color':"green"}],
+                       'steps':[{'range':[0,98],'color':"lightgray"},
+                                {'range':[98,99.5],'color':"yellow"},
+                                {'range':[99.5,100],'color':"green"}],
                        'threshold': {'line': {'color': "red", 'width': 4}, 'thickness': 0.75, 'value': 99}}
             ))
             fig.update_layout(height=250, margin=dict(l=0,r=0,t=0,b=0))
@@ -436,7 +491,9 @@ with tab1:
             fig = go.Figure(go.Indicator(
                 mode="gauge+number", value=val, title={'text': "O₂ in H₂ (ppm)"},
                 gauge={'axis': {'range': [None, 500]},
-                       'steps':[{'range':[0,100],'color':"green"},{'range':[100,300],'color':"yellow"},{'range':[300,500],'color':"red"}],
+                       'steps':[{'range':[0,100],'color':"green"},
+                                {'range':[100,300],'color':"yellow"},
+                                {'range':[300,500],'color':"red"}],
                        'threshold': {'line': {'color': "red", 'width': 4}, 'thickness': 0.75, 'value': 400}}
             ))
             fig.update_layout(height=250, margin=dict(l=0,r=0,t=0,b=0))
@@ -449,7 +506,9 @@ with tab1:
             fig = go.Figure(go.Indicator(
                 mode="gauge+number", value=val, title={'text': "Hours Since Maintenance"},
                 gauge={'axis': {'range': [None, 2500]},
-                       'steps':[{'range':[0,1000],'color':"green"},{'range':[1000,2000],'color':"yellow"},{'range':[2000,2500],'color':"red"}],
+                       'steps':[{'range':[0,1000],'color':"green"},
+                                {'range':[1000,2000],'color':"yellow"},
+                                {'range':[2000,2500],'color':"red"}],
                        'threshold': {'line': {'color': "red", 'width': 4}, 'thickness': 0.75, 'value': 2000}}
             ))
             fig.update_layout(height=250, margin=dict(l=0,r=0,t=0,b=0))
