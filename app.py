@@ -524,14 +524,21 @@ with tab1:
         else:
             st.info("Hours Since Maintenance: N/A")
 
+            
+
+# ---------- Tab 2 ----------
 # ---------- Tab 2 ----------
 with tab2:
     st.markdown("### Predictive Analytics - Equipment Failure Forecast")
+
     if st.button("Generate Predictions", type="primary"):
         with st.spinner("Running Nixtla TimeGPT model (simulated)…"):
             st.session_state.predictions = generate_predictions(df_view, forecast_horizon)
+
     if st.session_state.get("predictions") is not None:
         pred_df = st.session_state.predictions
+
+        # --- Prediction summary cards ---
         col1, col2, col3, col4 = st.columns(4)
         with col1:
             max_voltage = pred_df["predicted_voltage"].max()
@@ -551,7 +558,37 @@ with tab2:
             confidence = 100 - (pred_df["uncertainty"].mean() * 100)
             st.metric("Model Confidence", f"{confidence:.1f}%", "High" if confidence>80 else "Medium")
 
+        # --- New: Validation Snapshot ---
+        try:
+            bt_details, calib, err = rolling_backtest(
+                df_view if op_only else df,
+                horizon=int(forecast_horizon),
+                window=168,   # 1-week training window
+                step=24,      # evaluate every day
+                risk_thr_percent=int(risk_threshold)
+            )
+        except NameError:
+            bt_details, calib, err = None, None, "rolling_backtest not available"
+
+        if (err is None) and (bt_details is not None) and (len(bt_details) > 0):
+            pi95_cov = float(bt_details["PI95_coverage"].mean())
+            rmse     = float(bt_details["RMSE"].mean())
+            brier    = float(bt_details["Brier"].mean())
+
+            st.markdown("#### Validation Snapshot (recent walk-forward)")
+            k1, k2, k3 = st.columns(3)
+            with k1:
+                st.metric("PI95 Coverage (backtest)", f"{pi95_cov:.0%}", help="Should be near 95% if intervals are well-calibrated")
+            with k2:
+                st.metric("RMSE (backtest)", f"{rmse:.3f} V", help="Lower is better")
+            with k3:
+                st.metric("Brier score", f"{brier:.3f}", help="Probability calibration; lower is better")
+        else:
+            st.info("No backtest snapshot available yet. Use the Validation tab for full evaluation.")
+
         st.markdown("---")
+
+        # --- Charts ---
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=df_view["timestamp"].tail(168), y=df_view["cell_voltage"].tail(168), mode="lines", name="Historical"))
         fig.add_trace(go.Scatter(x=pred_df["timestamp"], y=pred_df["predicted_voltage"], mode="lines", name="Prediction", line=dict(dash="dash")))
