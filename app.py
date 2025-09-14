@@ -105,33 +105,41 @@ def build_timestamps_from_time_column(time_series: pd.Series) -> pd.Series:
       - Excel serials (fractions of a day or date+time serials)
     Return full timestamps by rolling the day when time-of-day decreases.
     """
-    # 1) General parser (handles full datetimes, many formats)
+    # 1) General parser (handles full datetimes & many string formats)
     t_dt = pd.to_datetime(time_series, errors="coerce")
 
-    # 2) Excel serials → datetime
+    # 2) Excel serials (e.g., 0.75 or 45234.5) → datetime
     num = pd.to_numeric(time_series, errors="coerce")
     mask = t_dt.isna() & num.notna()
     if mask.any():
-        # Excel origin for pandas is '1899-12-30'
-        t_dt.loc[mask] = pd.to_datetime(num[mask], unit="D", origin="1899-12-30", errors="coerce")
+        t_dt.loc[mask] = pd.to_datetime(
+            num[mask], unit="D", origin="1899-12-30", errors="coerce"
+        )
 
-    # 3) Strict time-only formats
+    # 3) Strict time-only strings (ensure we COERCE, never IGNORE)
     mask = t_dt.isna()
     if mask.any():
-        # HH:MM:SS
-        t_dt.loc[mask] = pd.to_datetime(time_series[mask].astype(str).str.strip(),
-                                        format="%H:%M:%S", errors="ignore")
+        t_dt.loc[mask] = pd.to_datetime(
+            time_series[mask].astype(str).str.strip(),
+            format="%H:%M:%S",
+            errors="coerce"
+        )
     mask = t_dt.isna()
     if mask.any():
-        # HH:MM
-        t_dt.loc[mask] = pd.to_datetime(time_series[mask].astype(str).str.strip(),
-                                        format="%H:%M", errors="coerce")
+        t_dt.loc[mask] = pd.to_datetime(
+            time_series[mask].astype(str).str.strip(),
+            format="%H:%M",
+            errors="coerce"
+        )
+
+    # 4) Enforce datetimelike dtype
+    t_dt = pd.to_datetime(t_dt, errors="coerce")
 
     if t_dt.isna().all():
         raise ValueError("Unable to parse the 'Time' column into datetime.")
 
     # If real calendar dates are present (>1901), use them directly
-    if (t_dt.dt.year > 1901).any():
+    if (t_dt.dropna().dt.year > 1901).any():
         return t_dt
 
     # Otherwise reconstruct dates by rolling at midnight
