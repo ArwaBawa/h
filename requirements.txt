@@ -5,6 +5,6 @@ plotly
 scipy
 openpyxl
 xlrd
-nixtla
-statsforecast
 scikit-learn
+xgboost           # optional; app falls back if missing
+nixtla>=0.5.0     # optional; enable TimeGPT if installed + API key provided
